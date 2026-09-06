@@ -1,0 +1,129 @@
+name: Web to APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      icon_url:
+        description: "URL icon"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build WebView APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          set -euo pipefail
+          [[ "$WEB_URL" =~ ^https?:// ]] || { echo "::error::web_url harus diawali http:// atau https://"; exit 1; }
+          [[ -n "$APP_NAME" ]] || { echo "::error::app_name kosong"; exit 1; }
+          [[ "$ICON_URL" =~ ^https?:// ]] || { echo "::error::icon_url tidak valid"; exit 1; }
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Android project
+        shell: bash
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          ICON_URL: ${{ inputs.icon_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p web2apk/app/src/main/java/com/elxz/web2apk
+          mkdir -p web2apk/app/src/main/res/drawable
+          mkdir -p web2apk/app/src/main/res/mipmap-hdpi
+          mkdir -p web2apk/app/src/main/res/mipmap-mdpi
+          mkdir -p web2apk/app/src/main/res/mipmap-xhdpi
+          mkdir -p web2apk/app/src/main/res/mipmap-xxhdpi
+          mkdir -p web2apk/app/src/main/res/mipmap-xxxhdpi
+
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          url = os.environ['WEB_URL']
+          name = os.environ['APP_NAME']
+          safe = re.sub(r'[^A-Za-z0-9_]', '_', name).strip('_') or 'WebApp'
+          safe = safe[:40]
+
+          # Escape Java string content safely.
+          java_url = url.replace('\\', '\\\\').replace('"', '\\"')
+          java_name = name.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ')
+
+          Path('web2apk/settings.gradle').write_text('''pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = "Web2Apk"\ninclude(":app")\n''')
+
+          Path('web2apk/build.gradle').write_text('''plugins {\n    id 'com.android.application' version '8.7.3' apply false\n}\n''')
+
+          Path('web2apk/gradle.properties').write_text('''org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\n''')
+
+          Path('web2apk/app/build.gradle').write_text('''plugins { id 'com.android.application' }\n\nandroid {\n    namespace 'com.elxz.web2apk'\n    compileSdk 35\n\n    defaultConfig {\n        applicationId 'com.elxz.web2apk'\n        minSdk 23\n        targetSdk 35\n        versionCode 1\n        versionName '1.0'\n    }\n\n    buildTypes {\n        release { minifyEnabled false }\n    }\n}\n\ndependencies {\n    implementation 'androidx.appcompat:appcompat:1.7.0'\n    implementation 'androidx.activity:activity:1.10.1'\n}\n''')
+
+          Path('web2apk/app/src/main/AndroidManifest.xml').write_text('''<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application\n        android:theme="@style/AppTheme"\n        android:label="%s"\n        android:icon="@drawable/icon">\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN" />\n                <category android:name="android.intent.category.LAUNCHER" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n''' % java_name)
+
+          Path('web2apk/app/src/main/res/values').mkdir(parents=True, exist_ok=True)
+          Path('web2apk/app/src/main/res/values/styles.xml').write_text('''<resources>\n    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">\n        <item name="android:fontFamily">sans</item>\n        <item name="android:colorAccent">#555555</item>\n        <item name="android:navigationBarColor">#000000</item>\n    </style>\n</resources>\n''')
+
+          Path('web2apk/app/src/main/java/com/elxz/web2apk/MainActivity.java').write_text('''package com.elxz.web2apk;\n\nimport android.annotation.SuppressLint;\nimport android.app.Activity;\nimport android.os.Bundle;\nimport android.webkit.WebChromeClient;\nimport android.webkit.WebResourceRequest;\nimport android.webkit.WebSettings;\nimport android.webkit.WebView;\nimport android.webkit.WebViewClient;\n\npublic class MainActivity extends Activity {\n    private static final String START_URL = "%s";\n    private WebView webView;\n\n    @SuppressLint("SetJavaScriptEnabled")\n    @Override\n    protected void onCreate(Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        webView = new WebView(this);\n        setContentView(webView);\n\n        WebSettings s = webView.getSettings();\n        s.setJavaScriptEnabled(true);\n        s.setDomStorageEnabled(true);\n        s.setAllowFileAccess(false);\n        s.setAllowContentAccess(false);\n        s.setBuiltInZoomControls(false);\n        s.setDisplayZoomControls(false);\n\n        webView.setWebChromeClient(new WebChromeClient());\n        webView.setWebViewClient(new WebViewClient() {\n            @Override\n            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {\n                return false;\n            }\n        });\n        webView.loadUrl(START_URL);\n    }\n\n    @Override\n    public void onBackPressed() {\n        if (webView != null && webView.canGoBack()) webView.goBack();\n        else super.onBackPressed();\n    }\n}\n''' % java_url)
+          PY
+
+          # Download icon. If the URL is a GitHub/private release asset, the token is useful.
+          curl --fail --show-error --location --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$ICON_URL" -o web2apk/app/src/main/res/drawable/icon.png
+
+          file web2apk/app/src/main/res/drawable/icon.png || true
+          test -s web2apk/app/src/main/res/drawable/icon.png
+
+          # Generate Gradle wrapper using the runner's Gradle if available.
+          cd web2apk
+          gradle wrapper --gradle-version 8.11.1
+
+      - name: Build APK
+        working-directory: web2apk
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apk-output
+          cp web2apk/app/build/outputs/apk/release/app-release.apk apk-output/web2apk.apk
+          ls -lah apk-output/web2apk.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-web2apk-${{ github.run_id }}
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 1      
