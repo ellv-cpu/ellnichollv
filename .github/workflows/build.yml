@@ -132,36 +132,44 @@ jobs:
           test -f "$PUBSPEC"
           cp "$PUBSPEC" "$PUBSPEC.bak"
 
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml || true
+
           python3 - <<'PY'
-          import re, pathlib
+          import re, pathlib, sys
+
           p = pathlib.Path("pubspec.yaml")
           text = p.read_text(encoding="utf-8", errors="ignore")
           original = text
 
+          # PENTING: setiap pattern di-anchor ke AWAL BARIS (^\s*key\s*:) dengan re.MULTILINE.
+          # Versi lama tidak punya anchor ini, sehingga "get:" / "dio:" / "http:" bisa
+          # ke-match di TENGAH kata lain (mis. "target:", "widget:", "audio:", "https://...")
+          # di bagian manapun dari pubspec.yaml (termasuk config flutter_icons/flutter_native_splash),
+          # merusak baris tersebut dan bikin YAML jadi invalid ("Mapping values are not allowed here").
           replacements = [
-            (r"font_awesome_flutter\s*:\s*[^\n]+", "font_awesome_flutter: ^10.12.0"),
-            (r"flutter_launcher_icons\s*:\s*[^\n]+", "flutter_launcher_icons: ^0.14.3"),
-            (r"flutter_native_splash\s*:\s*[^\n]+", "flutter_native_splash: ^2.4.4"),
-            (r"sqflite\s*:\s*[^\n]+", "sqflite: ^2.4.1"),
-            (r"path_provider\s*:\s*[^\n]+", "path_provider: ^2.1.5"),
-            (r"shared_preferences\s*:\s*[^\n]+", "shared_preferences: ^2.3.5"),
-            (r"http\s*:\s*[^\n]+", "http: ^1.2.2"),
-            (r"webview_flutter\s*:\s*[^\n]+", "webview_flutter: ^4.10.0"),
-            (r"image_picker\s*:\s*[^\n]+", "image_picker: ^1.1.2"),
-            (r"permission_handler\s*:\s*[^\n]+", "permission_handler: ^11.3.1"),
-            (r"url_launcher\s*:\s*[^\n]+", "url_launcher: ^6.3.1"),
-            (r"cached_network_image\s*:\s*[^\n]+", "cached_network_image: ^3.4.1"),
-            (r"provider\s*:\s*[^\n]+", "provider: ^6.1.2"),
-            (r"get\s*:\s*[^\n]+", "get: ^4.6.6"),
-            (r"get_it\s*:\s*[^\n]+", "get_it: ^8.0.3"),
-            (r"dio\s*:\s*[^\n]+", "dio: ^5.7.0"),
-            (r"intl\s*:\s*[^\n]+", "intl: ^0.19.0"),
+            (r"^(\s*)font_awesome_flutter\s*:\s*.+$", r"\1font_awesome_flutter: ^10.12.0"),
+            (r"^(\s*)flutter_launcher_icons\s*:\s*.+$", r"\1flutter_launcher_icons: ^0.14.3"),
+            (r"^(\s*)flutter_native_splash\s*:\s*.+$", r"\1flutter_native_splash: ^2.4.4"),
+            (r"^(\s*)sqflite\s*:\s*.+$", r"\1sqflite: ^2.4.1"),
+            (r"^(\s*)path_provider\s*:\s*.+$", r"\1path_provider: ^2.1.5"),
+            (r"^(\s*)shared_preferences\s*:\s*.+$", r"\1shared_preferences: ^2.3.5"),
+            (r"^(\s*)http\s*:\s*.+$", r"\1http: ^1.2.2"),
+            (r"^(\s*)webview_flutter\s*:\s*.+$", r"\1webview_flutter: ^4.10.0"),
+            (r"^(\s*)image_picker\s*:\s*.+$", r"\1image_picker: ^1.1.2"),
+            (r"^(\s*)permission_handler\s*:\s*.+$", r"\1permission_handler: ^11.3.1"),
+            (r"^(\s*)url_launcher\s*:\s*.+$", r"\1url_launcher: ^6.3.1"),
+            (r"^(\s*)cached_network_image\s*:\s*.+$", r"\1cached_network_image: ^3.4.1"),
+            (r"^(\s*)provider\s*:\s*.+$", r"\1provider: ^6.1.2"),
+            (r"^(\s*)get_it\s*:\s*.+$", r"\1get_it: ^8.0.3"),
+            (r"^(\s*)get\s*:\s*.+$", r"\1get: ^4.6.6"),
+            (r"^(\s*)dio\s*:\s*.+$", r"\1dio: ^5.7.0"),
+            (r"^(\s*)intl\s*:\s*.+$", r"\1intl: ^0.19.0"),
           ]
 
           for pattern, repl in replacements:
-              text2, n = re.subn(pattern, repl, text)
+              text2, n = re.subn(pattern, repl, text, flags=re.MULTILINE)
               if n:
-                  print(f"Patched dependency: {repl}")
+                  print(f"Patched dependency line matching: {pattern}")
                   text = text2
 
           text2, n = re.subn(
@@ -183,12 +191,30 @@ jobs:
                   text = text.rstrip() + "\n  font_awesome_flutter: ^10.12.0\n"
                   print("Added font_awesome_flutter to existing dependency_overrides")
 
+          # JARING PENGAMAN: validasi hasil akhir sebagai YAML yang benar-benar valid.
+          # Kalau project punya struktur pubspec yang tidak terduga dan hasil patch
+          # ternyata malah invalid, JANGAN dipakai — kembalikan ke pubspec.yaml asli
+          # supaya build lanjut dengan file original (lebih baik daripada gagal total
+          # karena file yang kita rusak sendiri).
+          if text != original:
+              try:
+                  import yaml
+                  yaml.safe_load(text)
+              except Exception as e:
+                  print(f"::warning::Hasil patch pubspec.yaml tidak valid sebagai YAML ({e}). "
+                        f"Membatalkan patch, memakai pubspec.yaml asli.")
+                  text = original
+
           if text != original:
               p.write_text(text, encoding="utf-8")
               print("pubspec.yaml updated for compatibility")
           else:
               print("pubspec.yaml unchanged")
           PY
+
+          # Validasi akhir juga di level bash (jaga-jaga kalau python/pyyaml gagal ke-install):
+          # cek file masih bisa dibaca minimal (tidak kosong).
+          test -s "$PUBSPEC"
 
       - name: Ensure compatible Gradle / AGP / Kotlin / SDK
         working-directory: ${{ env.PROJECT_DIR }}
@@ -232,6 +258,24 @@ jobs:
             sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 35/g' "$f" || true
             sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 35/g' "$f" || true
             sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[0-9]+/minSdk = 21/g' "$f" || true
+          done
+
+          # AGP 8+ mewajibkan `namespace` di android {} block. Project Flutter lama
+          # (dibuat sebelum fitur ini ada) biasanya tidak punya ini sama sekali,
+          # dan akan gagal build dengan "Namespace not specified" setelah AGP di-bump.
+          # Ambil applicationId yang sudah ada sebagai fallback namespace kalau belum ada.
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            if ! grep -qE "namespace[[:space:]]*=?[[:space:]]*[\"']" "$f"; then
+              APP_ID=$(grep -oE 'applicationId[[:space:]]*=?[[:space:]]*"[^"]+"' "$f" | head -n1 | grep -oE '"[^"]+"' | tr -d '"')
+              APP_ID="${APP_ID:-com.example.app}"
+              echo "namespace tidak ditemukan di $f — menambahkan namespace \"$APP_ID\""
+              if [[ "$f" == *.kts ]]; then
+                sed -i -E "0,/android[[:space:]]*\{/s//android {\n    namespace = \"${APP_ID}\"/" "$f" || true
+              else
+                sed -i -E "0,/android[[:space:]]*\{/s//android {\n    namespace \"${APP_ID}\"/" "$f" || true
+              fi
+            fi
           done
 
           GP="android/gradle.properties"
