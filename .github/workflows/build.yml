@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: flutter-build-${{ github.workflow }}-${{ inputs.tag }}
@@ -43,14 +44,29 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/input"
           echo "Downloading project ZIP..."
-          curl --fail --show-error --location --retry 4 --retry-all-errors \
+          echo "URL: $ZIP_URL"
+
+          HTTP_CODE=$(curl --silent --show-error --location --retry 4 --retry-all-errors \
             --connect-timeout 20 --max-time 300 \
+            -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/octet-stream" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$ZIP_URL" -o "$GITHUB_WORKSPACE/input/project.zip"
+            "$ZIP_URL" -o "$GITHUB_WORKSPACE/input/project.zip" || true)
+
+          if [ ! -s "$GITHUB_WORKSPACE/input/project.zip" ] || [ "${HTTP_CODE:-0}" = "403" ] || [ "${HTTP_CODE:-0}" = "404" ]; then
+            echo "First attempt failed (HTTP ${HTTP_CODE:-unknown}). Retrying..."
+            curl --fail --show-error --location --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 300 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$ZIP_URL" -o "$GITHUB_WORKSPACE/input/project.zip"
+          fi
+
           test -s "$GITHUB_WORKSPACE/input/project.zip"
           file "$GITHUB_WORKSPACE/input/project.zip" || true
+          ls -lah "$GITHUB_WORKSPACE/input/project.zip"
 
       - name: Extract project
         shell: bash
