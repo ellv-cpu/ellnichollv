@@ -32,7 +32,7 @@ jobs:
   build:
     name: Build Flutter APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Download project ZIP
@@ -74,7 +74,8 @@ jobs:
           set -euo pipefail
           rm -rf "$GITHUB_WORKSPACE/project"
           mkdir -p "$GITHUB_WORKSPACE/project"
-          unzip -q "$GITHUB_WORKSPACE/input/project.zip" -d "$GITHUB_WORKSPACE/project"
+          unzip -q "$GITHUB_WORKSPACE/input/project.zip" -d "$GITHUB_WORKSPACE/project" || \
+            unzip -o "$GITHUB_WORKSPACE/input/project.zip" -d "$GITHUB_WORKSPACE/project"
 
       - name: Locate Flutter project
         shell: bash
@@ -82,57 +83,13 @@ jobs:
           set -euo pipefail
           PUBSPEC="$(find "$GITHUB_WORKSPACE/project" -type f -name pubspec.yaml -print -quit)"
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP."
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter."
             exit 1
           fi
           PROJECT_DIR="$(dirname "$PUBSPEC")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Flutter project: $PROJECT_DIR"
-
-      - name: Ensure compatible Gradle wrapper version
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          WRAPPER_PROPS="android/gradle/wrapper/gradle-wrapper.properties"
-          # Banyak project ZIP yang di-upload user pakai versi Gradle lama
-          # (mis. 8.12.0), padahal Flutter stable sekarang butuh minimal
-          # Gradle 8.14.0. Daripada gagal di step build, paksa naikkan
-          # versinya di sini dulu supaya kompatibel dengan Flutter Gradle
-          # plugin, apapun versi bawaan project-nya.
-          if [ -f "$WRAPPER_PROPS" ]; then
-            echo "Sebelum:"; grep distributionUrl "$WRAPPER_PROPS" || true
-            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER_PROPS"
-            echo "Sesudah:"; grep distributionUrl "$WRAPPER_PROPS" || true
-          else
-            echo "gradle-wrapper.properties tidak ditemukan di $WRAPPER_PROPS, lewati step ini (mungkin belum pernah build android sama sekali)."
-          fi
-
-      - name: Ensure compatible Android Gradle Plugin (AGP) version
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          MIN_AGP="8.11.1"
-          # Sama seperti versi Gradle: AGP versi lama (mis. 8.9.1) di project
-          # yang di-upload user bisa lebih rendah dari minimum yang didukung
-          # Flutter. AGP versi didefinisikan di salah satu dari beberapa
-          # kemungkinan file tergantung template project (settings.gradle(.kts)
-          # dengan blok plugins, atau top-level build.gradle(.kts) dengan
-          # classpath com.android.tools.build:gradle). Cek semuanya dan paksa
-          # naikkan ke versi minimum, apapun versi bawaannya.
-          FILES=$(find android -maxdepth 1 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null || true)
-          for f in $FILES; do
-            if grep -qE "com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'][0-9]+\.[0-9]+\.[0-9]+[\"']" "$f"; then
-              echo "Patch AGP (plugins block) di $f"
-              sed -i -E "s#(com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\1${MIN_AGP}\2#" "$f"
-            fi
-            if grep -qE "com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+\.[0-9]+" "$f"; then
-              echo "Patch AGP (classpath) di $f"
-              sed -i -E "s#(com\.android\.tools\.build:gradle:)[0-9]+\.[0-9]+\.[0-9]+#\1${MIN_AGP}#" "$f"
-            fi
-          done
-          echo "Selesai cek versi AGP."
+          ls -la "$PROJECT_DIR" | head -40
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -150,11 +107,165 @@ jobs:
       - name: Flutter version
         run: flutter --version
 
-      - name: Flutter pub get
+      - name: Ensure Android platform exists
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            echo "Folder android/ tidak ada — generate dengan flutter create..."
+            flutter create . --platforms=android --project-name app 2>/dev/null || \
+              flutter create . --platforms=android || true
+          fi
+          if [ ! -d android ]; then
+            echo "::error::Gagal membuat folder android/"
+            exit 1
+          fi
+          echo "android/ siap."
 
-      - name: Flutter analyze
+      - name: Auto-fix pubspec (compat packages)
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBSPEC="pubspec.yaml"
+          test -f "$PUBSPEC"
+          cp "$PUBSPEC" "$PUBSPEC.bak"
+
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("pubspec.yaml")
+          text = p.read_text(encoding="utf-8", errors="ignore")
+          original = text
+
+          replacements = [
+            (r"font_awesome_flutter\s*:\s*[^\n]+", "font_awesome_flutter: ^10.12.0"),
+            (r"flutter_launcher_icons\s*:\s*[^\n]+", "flutter_launcher_icons: ^0.14.3"),
+            (r"flutter_native_splash\s*:\s*[^\n]+", "flutter_native_splash: ^2.4.4"),
+            (r"sqflite\s*:\s*[^\n]+", "sqflite: ^2.4.1"),
+            (r"path_provider\s*:\s*[^\n]+", "path_provider: ^2.1.5"),
+            (r"shared_preferences\s*:\s*[^\n]+", "shared_preferences: ^2.3.5"),
+            (r"http\s*:\s*[^\n]+", "http: ^1.2.2"),
+            (r"webview_flutter\s*:\s*[^\n]+", "webview_flutter: ^4.10.0"),
+            (r"image_picker\s*:\s*[^\n]+", "image_picker: ^1.1.2"),
+            (r"permission_handler\s*:\s*[^\n]+", "permission_handler: ^11.3.1"),
+            (r"url_launcher\s*:\s*[^\n]+", "url_launcher: ^6.3.1"),
+            (r"cached_network_image\s*:\s*[^\n]+", "cached_network_image: ^3.4.1"),
+            (r"provider\s*:\s*[^\n]+", "provider: ^6.1.2"),
+            (r"get\s*:\s*[^\n]+", "get: ^4.6.6"),
+            (r"get_it\s*:\s*[^\n]+", "get_it: ^8.0.3"),
+            (r"dio\s*:\s*[^\n]+", "dio: ^5.7.0"),
+            (r"intl\s*:\s*[^\n]+", "intl: ^0.19.0"),
+          ]
+
+          for pattern, repl in replacements:
+              text2, n = re.subn(pattern, repl, text)
+              if n:
+                  print(f"Patched dependency: {repl}")
+                  text = text2
+
+          text2, n = re.subn(
+              r"environment\s*:\s*\n\s*sdk\s*:\s*[\"'][^\"']+[\"']",
+              "environment:\n  sdk: \">=3.0.0 <4.0.0\"",
+              text,
+              count=1,
+          )
+          if n:
+              print("Patched environment.sdk to >=3.0.0 <4.0.0")
+              text = text2
+
+          if "dependency_overrides:" not in text:
+              text = text.rstrip() + "\n\ndependency_overrides:\n  font_awesome_flutter: ^10.12.0\n"
+              print("Added dependency_overrides for font_awesome_flutter")
+          else:
+              tail = text.split("dependency_overrides:")[-1]
+              if "font_awesome_flutter" not in tail:
+                  text = text.rstrip() + "\n  font_awesome_flutter: ^10.12.0\n"
+                  print("Added font_awesome_flutter to existing dependency_overrides")
+
+          if text != original:
+              p.write_text(text, encoding="utf-8")
+              print("pubspec.yaml updated for compatibility")
+          else:
+              print("pubspec.yaml unchanged")
+          PY
+
+      - name: Ensure compatible Gradle / AGP / Kotlin / SDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WRAPPER_PROPS="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER_PROPS" ]; then
+            echo "Patch Gradle wrapper -> 8.14.2"
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER_PROPS"
+            grep distributionUrl "$WRAPPER_PROPS" || true
+          else
+            echo "gradle-wrapper.properties tidak ada — generate via flutter create..."
+            flutter create . --platforms=android || true
+          fi
+
+          MIN_AGP="8.7.3"
+          FILES=$(find android -maxdepth 2 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null || true)
+          for f in $FILES; do
+            if grep -qE "com\.android\.application" "$f"; then
+              sed -i -E "s#(com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\1${MIN_AGP}\2#" "$f" || true
+            fi
+            if grep -qE "com\.android\.tools\.build:gradle:" "$f"; then
+              sed -i -E "s#(com\.android\.tools\.build:gradle:)[0-9]+\.[0-9]+\.[0-9]+#\1${MIN_AGP}#" "$f" || true
+            fi
+            if grep -qE "org\.jetbrains\.kotlin\.android" "$f"; then
+              sed -i -E "s#(org\.jetbrains\.kotlin\.android[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\11.9.24\2#" "$f" || true
+            fi
+            if grep -qE "org\.jetbrains\.kotlin:kotlin-gradle-plugin:" "$f"; then
+              sed -i -E "s#(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9]+\.[0-9]+\.[0-9]+#\11.9.24#" "$f" || true
+            fi
+          done
+
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            echo "Patch SDK levels di $f"
+            sed -i -E 's/compileSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdk 35/g' "$f" || true
+            sed -i -E 's/targetSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdk 35/g' "$f" || true
+            sed -i -E 's/minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/minSdk 21/g' "$f" || true
+            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 35/g' "$f" || true
+            sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 35/g' "$f" || true
+            sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[0-9]+/minSdk = 21/g' "$f" || true
+          done
+
+          GP="android/gradle.properties"
+          touch "$GP"
+          grep -q "org.gradle.jvmargs" "$GP" || echo "org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError" >> "$GP"
+          grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
+          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
+          echo "Gradle/AGP/SDK patch selesai."
+
+      - name: Flutter pub get (with retry + upgrade fallback)
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          flutter pub get 2>&1 | tee /tmp/pubget.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" -ne 0 ]; then
+            echo "pub get gagal — coba flutter pub upgrade..."
+            flutter pub upgrade || true
+            flutter pub get
+          fi
+
+      - name: Upgrade fragile packages
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub upgrade font_awesome_flutter 2>/dev/null || true
+          flutter pub upgrade flutter_launcher_icons 2>/dev/null || true
+          flutter pub get || true
+
+      - name: Flutter analyze (non-blocking)
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
         run: |
@@ -162,21 +273,43 @@ jobs:
           flutter analyze --no-fatal-infos || true
           echo "[END_RESULT_ANALYZE]"
 
-      - name: Build release APK
-        if: inputs.build_type == 'release'
+      - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -o pipefail
-          flutter build apk --release --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+          BUILD_TYPE="${{ inputs.build_type }}"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            FLAG="--debug"
+          else
+            FLAG="--release"
+          fi
 
-      - name: Build debug APK
-        if: inputs.build_type == 'debug'
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -o pipefail
-          flutter build apk --debug --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+          set +e
+          flutter build apk $FLAG --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+          CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$CODE" -ne 0 ]; then
+            if grep -qiE "can't be extended|final class|IconData|font_awesome|version solving|Could not resolve|AndroidX" "$GITHUB_WORKSPACE/build-output.log"; then
+              echo "::warning::Build gagal karena dependency/compat — auto-fix & rebuild..."
+              flutter pub upgrade || true
+              flutter pub upgrade font_awesome_flutter || true
+              if [ -f analysis_options.yaml ]; then
+                printf 'analyzer:\n  errors:\n    invalid_annotation_target: ignore\n' > analysis_options.yaml
+              fi
+              flutter pub get || true
+              set +e
+              flutter build apk $FLAG --android-skip-build-dependency-validation 2>&1 | tee -a "$GITHUB_WORKSPACE/build-output.log"
+              CODE=${PIPESTATUS[0]}
+              set -e
+            fi
+          fi
+
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::Flutter build gagal (exit $CODE)"
+            exit "$CODE"
+          fi
 
       - name: Show build failure details
         if: failure()
@@ -184,9 +317,9 @@ jobs:
         run: |
           echo "::group::Tail of flutter build output"
           if [ -f "$GITHUB_WORKSPACE/build-output.log" ]; then
-            tail -n 150 "$GITHUB_WORKSPACE/build-output.log"
+            tail -n 200 "$GITHUB_WORKSPACE/build-output.log"
           else
-            echo "build-output.log tidak ditemukan (build gagal sebelum sempat menulis log)."
+            echo "build-output.log tidak ditemukan."
           fi
           echo "::endgroup::"
 
@@ -204,9 +337,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/apk-output"
-          find "$PROJECT_DIR/build/app/outputs/flutter-apk" -type f -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
-          if ! find "$GITHUB_WORKSPACE/apk-output" -type f -name '*.apk' -print -quit | grep -q .; then
+          find "${PROJECT_DIR}/build" -type f -name "*.apk" -exec cp -f {} "$GITHUB_WORKSPACE/apk-output/" \; 2>/dev/null || true
+          find "$GITHUB_WORKSPACE" -type f -path "*/flutter-apk/*.apk" -exec cp -f {} "$GITHUB_WORKSPACE/apk-output/" \; 2>/dev/null || true
+
+          if ! find "$GITHUB_WORKSPACE/apk-output" -type f -name "*.apk" -print -quit | grep -q .; then
             echo "::error::APK tidak ditemukan setelah build."
+            find "${PROJECT_DIR}/build" -type f -name "*.apk" 2>/dev/null || true
             exit 1
           fi
           ls -lah "$GITHUB_WORKSPACE/apk-output"
