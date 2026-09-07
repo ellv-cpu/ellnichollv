@@ -126,4 +126,4 @@ jobs:
           name: apk-web2apk-${{ github.run_id }}
           path: apk-output/*.apk
           if-no-files-found: error
-          retention-days: 1      
+          retention-days: 1
