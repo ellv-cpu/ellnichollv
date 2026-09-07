@@ -108,6 +108,32 @@ jobs:
             echo "gradle-wrapper.properties tidak ditemukan di $WRAPPER_PROPS, lewati step ini (mungkin belum pernah build android sama sekali)."
           fi
 
+      - name: Ensure compatible Android Gradle Plugin (AGP) version
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIN_AGP="8.11.1"
+          # Sama seperti versi Gradle: AGP versi lama (mis. 8.9.1) di project
+          # yang di-upload user bisa lebih rendah dari minimum yang didukung
+          # Flutter. AGP versi didefinisikan di salah satu dari beberapa
+          # kemungkinan file tergantung template project (settings.gradle(.kts)
+          # dengan blok plugins, atau top-level build.gradle(.kts) dengan
+          # classpath com.android.tools.build:gradle). Cek semuanya dan paksa
+          # naikkan ke versi minimum, apapun versi bawaannya.
+          FILES=$(find android -maxdepth 1 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null || true)
+          for f in $FILES; do
+            if grep -qE "com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'][0-9]+\.[0-9]+\.[0-9]+[\"']" "$f"; then
+              echo "Patch AGP (plugins block) di $f"
+              sed -i -E "s#(com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\1${MIN_AGP}\2#" "$f"
+            fi
+            if grep -qE "com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+\.[0-9]+" "$f"; then
+              echo "Patch AGP (classpath) di $f"
+              sed -i -E "s#(com\.android\.tools\.build:gradle:)[0-9]+\.[0-9]+\.[0-9]+#\1${MIN_AGP}#" "$f"
+            fi
+          done
+          echo "Selesai cek versi AGP."
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
