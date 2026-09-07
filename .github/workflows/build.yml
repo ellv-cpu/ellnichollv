@@ -89,6 +89,25 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Flutter project: $PROJECT_DIR"
 
+      - name: Ensure compatible Gradle wrapper version
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WRAPPER_PROPS="android/gradle/wrapper/gradle-wrapper.properties"
+          # Banyak project ZIP yang di-upload user pakai versi Gradle lama
+          # (mis. 8.12.0), padahal Flutter stable sekarang butuh minimal
+          # Gradle 8.14.0. Daripada gagal di step build, paksa naikkan
+          # versinya di sini dulu supaya kompatibel dengan Flutter Gradle
+          # plugin, apapun versi bawaan project-nya.
+          if [ -f "$WRAPPER_PROPS" ]; then
+            echo "Sebelum:"; grep distributionUrl "$WRAPPER_PROPS" || true
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER_PROPS"
+            echo "Sesudah:"; grep distributionUrl "$WRAPPER_PROPS" || true
+          else
+            echo "gradle-wrapper.properties tidak ditemukan di $WRAPPER_PROPS, lewati step ini (mungkin belum pernah build android sama sekali)."
+          fi
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
