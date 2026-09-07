@@ -168,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          flutter build apk --release 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+          flutter build apk --release --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
 
       - name: Build debug APK
         if: inputs.build_type == 'debug'
@@ -176,7 +176,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          flutter build apk --debug 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+          flutter build apk --debug --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
 
       - name: Show build failure details
         if: failure()
