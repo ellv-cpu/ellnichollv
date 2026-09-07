@@ -120,12 +120,39 @@ jobs:
       - name: Build release APK
         if: inputs.build_type == 'release'
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
 
       - name: Build debug APK
         if: inputs.build_type == 'debug'
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --debug
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --debug 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
+
+      - name: Show build failure details
+        if: failure()
+        shell: bash
+        run: |
+          echo "::group::Tail of flutter build output"
+          if [ -f "$GITHUB_WORKSPACE/build-output.log" ]; then
+            tail -n 150 "$GITHUB_WORKSPACE/build-output.log"
+          else
+            echo "build-output.log tidak ditemukan (build gagal sebelum sempat menulis log)."
+          fi
+          echo "::endgroup::"
+
+      - name: Upload build log artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: ${{ github.workspace }}/build-output.log
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Collect APK
         shell: bash
