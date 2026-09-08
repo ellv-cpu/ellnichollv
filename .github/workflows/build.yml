@@ -1,400 +1,152 @@
-name: Flutter APK Build
+name: build
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "GitHub Release asset API URL untuk ZIP project Flutter"
+        description: 'Direct download URL to the Flutter project ZIP (GitHub release asset)'
         required: true
         type: string
       tag:
-        description: "Tag build"
+        description: 'Build/release tag (from bot genTag)'
         required: true
         type: string
       build_type:
-        description: "Tipe APK"
-        required: true
+        description: 'Build type'
+        required: false
         type: choice
         options:
-          - release
           - debug
+          - release
         default: release
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: flutter-build-${{ github.workflow }}-${{ inputs.tag }}
-  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build Flutter APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
+    timeout-minutes: 25
     steps:
-      - name: Download project ZIP
-        shell: bash
-        env:
-          ZIP_URL: ${{ inputs.zip_url }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/input"
-          echo "Downloading project ZIP..."
-          echo "URL: $ZIP_URL"
+      - name: Checkout repo (ambil script auto-fix)
+        uses: actions/checkout@v4
 
-          HTTP_CODE=$(curl --silent --show-error --location --retry 4 --retry-all-errors \
-            --connect-timeout 20 --max-time 300 \
-            -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$ZIP_URL" -o "$GITHUB_WORKSPACE/input/project.zip" || true)
-
-          if [ ! -s "$GITHUB_WORKSPACE/input/project.zip" ] || [ "${HTTP_CODE:-0}" = "403" ] || [ "${HTTP_CODE:-0}" = "404" ]; then
-            echo "First attempt failed (HTTP ${HTTP_CODE:-unknown}). Retrying..."
-            curl --fail --show-error --location --retry 3 --retry-all-errors \
-              --connect-timeout 20 --max-time 300 \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$ZIP_URL" -o "$GITHUB_WORKSPACE/input/project.zip"
-          fi
-
-          test -s "$GITHUB_WORKSPACE/input/project.zip"
-          file "$GITHUB_WORKSPACE/input/project.zip" || true
-          ls -lah "$GITHUB_WORKSPACE/input/project.zip"
-
-      - name: Extract project
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/project"
-          mkdir -p "$GITHUB_WORKSPACE/project"
-          unzip -q "$GITHUB_WORKSPACE/input/project.zip" -d "$GITHUB_WORKSPACE/project" || \
-            unzip -o "$GITHUB_WORKSPACE/input/project.zip" -d "$GITHUB_WORKSPACE/project"
-
-      - name: Locate Flutter project
-        shell: bash
-        run: |
-          set -euo pipefail
-          PUBSPEC="$(find "$GITHUB_WORKSPACE/project" -type f -name pubspec.yaml -print -quit)"
-          if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter."
-            exit 1
-          fi
-          PROJECT_DIR="$(dirname "$PUBSPEC")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Flutter project: $PROJECT_DIR"
-          ls -la "$PROJECT_DIR" | head -40
-
-      - name: Setup Java 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-          cache: gradle
+          java-version: '17'
 
-      - name: Setup Flutter
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Flutter version
-        run: flutter --version
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.android/cache
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
-      - name: Ensure Android platform exists
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
+      - name: Download project ZIP
         run: |
-          set -euo pipefail
-          if [ ! -d android ]; then
-            echo "Folder android/ tidak ada — generate dengan flutter create..."
-            flutter create . --platforms=android --project-name app 2>/dev/null || \
-              flutter create . --platforms=android || true
-          fi
-          if [ ! -d android ]; then
-            echo "::error::Gagal membuat folder android/"
+          set -e
+          echo "Downloading: ${{ github.event.inputs.zip_url }}"
+          curl -fL --retry 3 --retry-delay 5 -o project.zip "${{ github.event.inputs.zip_url }}"
+          if [ ! -s project.zip ]; then
+            echo "::error::Gagal download ZIP dari zip_url (file kosong / link mati)."
             exit 1
           fi
-          echo "android/ siap."
 
-      - name: Auto-fix pubspec (compat packages)
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
+      - name: Extract project
         run: |
-          set -euo pipefail
-          PUBSPEC="pubspec.yaml"
-          test -f "$PUBSPEC"
-          cp "$PUBSPEC" "$PUBSPEC.bak"
-
-          python3 -m pip install --quiet --disable-pip-version-check pyyaml || true
-
-          python3 - <<'PY'
-          import re, pathlib, sys
-
-          p = pathlib.Path("pubspec.yaml")
-          text = p.read_text(encoding="utf-8", errors="ignore")
-          original = text
-
-          # PENTING: setiap pattern di-anchor ke AWAL BARIS (^\s*key\s*:) dengan re.MULTILINE.
-          # Versi lama tidak punya anchor ini, sehingga "get:" / "dio:" / "http:" bisa
-          # ke-match di TENGAH kata lain (mis. "target:", "widget:", "audio:", "https://...")
-          # di bagian manapun dari pubspec.yaml (termasuk config flutter_icons/flutter_native_splash),
-          # merusak baris tersebut dan bikin YAML jadi invalid ("Mapping values are not allowed here").
-          replacements = [
-            (r"^(\s*)font_awesome_flutter\s*:\s*.+$", r"\1font_awesome_flutter: ^10.12.0"),
-            (r"^(\s*)flutter_launcher_icons\s*:\s*.+$", r"\1flutter_launcher_icons: ^0.14.3"),
-            (r"^(\s*)flutter_native_splash\s*:\s*.+$", r"\1flutter_native_splash: ^2.4.4"),
-            (r"^(\s*)sqflite\s*:\s*.+$", r"\1sqflite: ^2.4.1"),
-            (r"^(\s*)path_provider\s*:\s*.+$", r"\1path_provider: ^2.1.5"),
-            (r"^(\s*)shared_preferences\s*:\s*.+$", r"\1shared_preferences: ^2.3.5"),
-            (r"^(\s*)http\s*:\s*.+$", r"\1http: ^1.2.2"),
-            (r"^(\s*)webview_flutter\s*:\s*.+$", r"\1webview_flutter: ^4.10.0"),
-            (r"^(\s*)image_picker\s*:\s*.+$", r"\1image_picker: ^1.1.2"),
-            (r"^(\s*)permission_handler\s*:\s*.+$", r"\1permission_handler: ^11.3.1"),
-            (r"^(\s*)url_launcher\s*:\s*.+$", r"\1url_launcher: ^6.3.1"),
-            (r"^(\s*)cached_network_image\s*:\s*.+$", r"\1cached_network_image: ^3.4.1"),
-            (r"^(\s*)provider\s*:\s*.+$", r"\1provider: ^6.1.2"),
-            (r"^(\s*)get_it\s*:\s*.+$", r"\1get_it: ^8.0.3"),
-            (r"^(\s*)get\s*:\s*.+$", r"\1get: ^4.6.6"),
-            (r"^(\s*)dio\s*:\s*.+$", r"\1dio: ^5.7.0"),
-            (r"^(\s*)intl\s*:\s*.+$", r"\1intl: ^0.19.0"),
-          ]
-
-          for pattern, repl in replacements:
-              text2, n = re.subn(pattern, repl, text, flags=re.MULTILINE)
-              if n:
-                  print(f"Patched dependency line matching: {pattern}")
-                  text = text2
-
-          text2, n = re.subn(
-              r"environment\s*:\s*\n\s*sdk\s*:\s*[\"'][^\"']+[\"']",
-              "environment:\n  sdk: \">=3.0.0 <4.0.0\"",
-              text,
-              count=1,
-          )
-          if n:
-              print("Patched environment.sdk to >=3.0.0 <4.0.0")
-              text = text2
-
-          if "dependency_overrides:" not in text:
-              text = text.rstrip() + "\n\ndependency_overrides:\n  font_awesome_flutter: ^10.12.0\n"
-              print("Added dependency_overrides for font_awesome_flutter")
-          else:
-              tail = text.split("dependency_overrides:")[-1]
-              if "font_awesome_flutter" not in tail:
-                  text = text.rstrip() + "\n  font_awesome_flutter: ^10.12.0\n"
-                  print("Added font_awesome_flutter to existing dependency_overrides")
-
-          # JARING PENGAMAN: validasi hasil akhir sebagai YAML yang benar-benar valid.
-          # Kalau project punya struktur pubspec yang tidak terduga dan hasil patch
-          # ternyata malah invalid, JANGAN dipakai — kembalikan ke pubspec.yaml asli
-          # supaya build lanjut dengan file original (lebih baik daripada gagal total
-          # karena file yang kita rusak sendiri).
-          if text != original:
-              try:
-                  import yaml
-                  yaml.safe_load(text)
-              except Exception as e:
-                  print(f"::warning::Hasil patch pubspec.yaml tidak valid sebagai YAML ({e}). "
-                        f"Membatalkan patch, memakai pubspec.yaml asli.")
-                  text = original
-
-          if text != original:
-              p.write_text(text, encoding="utf-8")
-              print("pubspec.yaml updated for compatibility")
-          else:
-              print("pubspec.yaml unchanged")
-          PY
-
-          # Validasi akhir juga di level bash (jaga-jaga kalau python/pyyaml gagal ke-install):
-          # cek file masih bisa dibaca minimal (tidak kosong).
-          test -s "$PUBSPEC"
-
-      - name: Ensure compatible Gradle / AGP / Kotlin / SDK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          WRAPPER_PROPS="android/gradle/wrapper/gradle-wrapper.properties"
-          if [ -f "$WRAPPER_PROPS" ]; then
-            echo "Patch Gradle wrapper -> 8.14.2"
-            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER_PROPS"
-            grep distributionUrl "$WRAPPER_PROPS" || true
-          else
-            echo "gradle-wrapper.properties tidak ada — generate via flutter create..."
-            flutter create . --platforms=android || true
-          fi
-
-          MIN_AGP="8.7.3"
-          FILES=$(find android -maxdepth 2 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) 2>/dev/null || true)
-          for f in $FILES; do
-            if grep -qE "com\.android\.application" "$f"; then
-              sed -i -E "s#(com\.android\.application[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\1${MIN_AGP}\2#" "$f" || true
-            fi
-            if grep -qE "com\.android\.tools\.build:gradle:" "$f"; then
-              sed -i -E "s#(com\.android\.tools\.build:gradle:)[0-9]+\.[0-9]+\.[0-9]+#\1${MIN_AGP}#" "$f" || true
-            fi
-            if grep -qE "org\.jetbrains\.kotlin\.android" "$f"; then
-              sed -i -E "s#(org\.jetbrains\.kotlin\.android[\"']?\)?[[:space:]]+version[[:space:]]+[\"'])[0-9]+\.[0-9]+\.[0-9]+([\"'])#\11.9.24\2#" "$f" || true
-            fi
-            if grep -qE "org\.jetbrains\.kotlin:kotlin-gradle-plugin:" "$f"; then
-              sed -i -E "s#(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9]+\.[0-9]+\.[0-9]+#\11.9.24#" "$f" || true
-            fi
-          done
-
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
-            [ -f "$f" ] || continue
-            echo "Patch SDK levels di $f"
-            sed -i -E 's/compileSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdk 35/g' "$f" || true
-            sed -i -E 's/targetSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdk 35/g' "$f" || true
-            sed -i -E 's/minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/minSdk 21/g' "$f" || true
-            sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 35/g' "$f" || true
-            sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 35/g' "$f" || true
-            sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[0-9]+/minSdk = 21/g' "$f" || true
-          done
-
-          # AGP 8+ mewajibkan `namespace` di android {} block. Project Flutter lama
-          # (dibuat sebelum fitur ini ada) biasanya tidak punya ini sama sekali,
-          # dan akan gagal build dengan "Namespace not specified" setelah AGP di-bump.
-          # Ambil applicationId yang sudah ada sebagai fallback namespace kalau belum ada.
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
-            [ -f "$f" ] || continue
-            if ! grep -qE "namespace[[:space:]]*=?[[:space:]]*[\"']" "$f"; then
-              APP_ID=$(grep -oE 'applicationId[[:space:]]*=?[[:space:]]*"[^"]+"' "$f" | head -n1 | grep -oE '"[^"]+"' | tr -d '"')
-              APP_ID="${APP_ID:-com.example.app}"
-              echo "namespace tidak ditemukan di $f — menambahkan namespace \"$APP_ID\""
-              if [[ "$f" == *.kts ]]; then
-                sed -i -E "0,/android[[:space:]]*\{/s//android {\n    namespace = \"${APP_ID}\"/" "$f" || true
-              else
-                sed -i -E "0,/android[[:space:]]*\{/s//android {\n    namespace \"${APP_ID}\"/" "$f" || true
-              fi
-            fi
-          done
-
-          GP="android/gradle.properties"
-          touch "$GP"
-          grep -q "org.gradle.jvmargs" "$GP" || echo "org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError" >> "$GP"
-          grep -q "android.useAndroidX" "$GP" || echo "android.useAndroidX=true" >> "$GP"
-          grep -q "android.enableJetifier" "$GP" || echo "android.enableJetifier=true" >> "$GP"
-          echo "Gradle/AGP/SDK patch selesai."
-
-      - name: Flutter pub get (with retry + upgrade fallback)
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          set +e
-          flutter pub get 2>&1 | tee /tmp/pubget.log
-          CODE=${PIPESTATUS[0]}
           set -e
-          if [ "$CODE" -ne 0 ]; then
-            echo "pub get gagal — coba flutter pub upgrade..."
-            flutter pub upgrade || true
+          mkdir -p project
+          unzip -oq project.zip -d project
+          rm -f project.zip
+
+      - name: Locate Flutter project (pubspec.yaml)
+        id: locate
+        run: |
+          set -e
+          PUBSPEC_PATH=$(find project -maxdepth 5 -iname "pubspec.yaml" | head -n 1)
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Ini bukan project Flutter yang valid."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
+          echo "Ditemukan project Flutter di: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-fix konfigurasi Gradle/Kotlin DSL yang umum bikin gagal
+        run: python3 .github/workflows/scripts/autofix_gradle.py "${{ steps.locate.outputs.dir }}"
+
+      - name: flutter pub get (dengan fallback upgrade kalau gagal)
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          if ! flutter pub get; then
+            echo "⚠️  pub get gagal, coba flutter pub upgrade --major-versions sebagai fallback..."
+            flutter pub upgrade --major-versions
             flutter pub get
           fi
 
-      - name: Upgrade fragile packages
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter pub upgrade font_awesome_flutter 2>/dev/null || true
-          flutter pub upgrade flutter_launcher_icons 2>/dev/null || true
-          flutter pub get || true
-
-      - name: Flutter analyze (non-blocking)
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Build APK
+        id: build
+        working-directory: ${{ steps.locate.outputs.dir }}
         continue-on-error: true
         run: |
-          echo "[RESULT_ANALYZE]"
-          flutter analyze --no-fatal-infos || true
-          echo "[END_RESULT_ANALYZE]"
-
-      - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
           set -o pipefail
-          BUILD_TYPE="${{ inputs.build_type }}"
-          if [ "$BUILD_TYPE" = "debug" ]; then
-            FLAG="--debug"
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug 2>&1 | tee /tmp/build.log
           else
-            FLAG="--release"
+            flutter build apk --release 2>&1 | tee /tmp/build.log
           fi
 
-          set +e
-          flutter build apk $FLAG --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build-output.log"
-          CODE=${PIPESTATUS[0]}
-          set -e
-
-          if [ "$CODE" -ne 0 ]; then
-            if grep -qiE "can't be extended|final class|IconData|font_awesome|version solving|Could not resolve|AndroidX" "$GITHUB_WORKSPACE/build-output.log"; then
-              echo "::warning::Build gagal karena dependency/compat — auto-fix & rebuild..."
-              flutter pub upgrade || true
-              flutter pub upgrade font_awesome_flutter || true
-              if [ -f analysis_options.yaml ]; then
-                printf 'analyzer:\n  errors:\n    invalid_annotation_target: ignore\n' > analysis_options.yaml
-              fi
-              flutter pub get || true
-              set +e
-              flutter build apk $FLAG --android-skip-build-dependency-validation 2>&1 | tee -a "$GITHUB_WORKSPACE/build-output.log"
-              CODE=${PIPESTATUS[0]}
-              set -e
-            fi
-          fi
-
-          if [ "$CODE" -ne 0 ]; then
-            echo "::error::Flutter build gagal (exit $CODE)"
-            exit "$CODE"
-          fi
-
-      - name: Show build failure details
-        if: failure()
-        shell: bash
-        run: |
-          echo "::group::Tail of flutter build output"
-          if [ -f "$GITHUB_WORKSPACE/build-output.log" ]; then
-            tail -n 200 "$GITHUB_WORKSPACE/build-output.log"
-          else
-            echo "build-output.log tidak ditemukan."
-          fi
-          echo "::endgroup::"
-
-      - name: Upload build log artifact
-        if: failure()
+      - name: Upload log build (selalu, buat debug kalau gagal)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ inputs.build_type }}-${{ inputs.tag }}
-          path: ${{ github.workspace }}/build-output.log
-          if-no-files-found: ignore
+          name: build-log-${{ github.event.inputs.tag }}
+          path: /tmp/build.log
           retention-days: 3
+          if-no-files-found: ignore
 
-      - name: Collect APK
-        shell: bash
+      - name: Gagalkan job kalau build APK memang gagal
+        if: steps.build.outcome == 'failure'
         run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/apk-output"
-          find "${PROJECT_DIR}/build" -type f -name "*.apk" -exec cp -f {} "$GITHUB_WORKSPACE/apk-output/" \; 2>/dev/null || true
-          find "$GITHUB_WORKSPACE" -type f -path "*/flutter-apk/*.apk" -exec cp -f {} "$GITHUB_WORKSPACE/apk-output/" \; 2>/dev/null || true
+          echo "::error::Build APK gagal. Ini kemungkinan besar error asli di project Flutter yang di-upload (bukan masalah workflow) — cek artifact 'build-log-${{ github.event.inputs.tag }}' buat detail lengkapnya."
+          tail -n 60 /tmp/build.log || true
+          exit 1
 
-          if ! find "$GITHUB_WORKSPACE/apk-output" -type f -name "*.apk" -print -quit | grep -q .; then
-            echo "::error::APK tidak ditemukan setelah build."
-            find "${PROJECT_DIR}/build" -type f -name "*.apk" 2>/dev/null || true
-            exit 1
+      - name: Locate built APK
+        id: apk
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
           fi
-          ls -lah "$GITHUB_WORKSPACE/apk-output"
+          if [ ! -f "$APK_PATH" ]; then
+            FOUND=$(find build -iname "*.apk" | head -n 1)
+            if [ -z "$FOUND" ]; then
+              echo "::error::File APK hasil build tidak ditemukan."
+              exit 1
+            fi
+            APK_PATH="$FOUND"
+          fi
+          echo "APK ada di: $APK_PATH"
+          echo "path=${{ steps.locate.outputs.dir }}/$APK_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.build_type }}-${{ inputs.tag }}
-          path: apk-output/*.apk
+          name: apk-build-${{ github.event.inputs.tag }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 3
           if-no-files-found: error
-          retention-days: 1
